@@ -38,6 +38,11 @@ export interface PortfolioPositionItem {
   marketValueBase: number;
   unrealizedPnlBase: number;
   valuationCurrency: string;
+  priceSource?: 'realtime_quote' | 'history_close' | 'missing' | string;
+  priceProvider?: string | null;
+  priceDate?: string | null;
+  priceStale?: boolean;
+  priceAvailable?: boolean;
 }
 
 export interface PortfolioAccountSnapshot {
@@ -285,4 +290,15 @@ export interface PortfolioImportBrokerItem {
 
 export interface PortfolioImportBrokerListResponse {
   brokers: PortfolioImportBrokerItem[];
+}
+
+export interface PortfolioFxRefreshResponse {
+  asOf: string;
+  accountCount: number;
+  refreshEnabled?: boolean;
+  disabledReason?: string | null;
+  pairCount: number;
+  updatedCount: number;
+  staleCount: number;
+  errorCount: number;
 }

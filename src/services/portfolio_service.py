@@ -34,6 +34,7 @@ VALID_COST_METHODS = {"fifo", "avg"}
 VALID_SIDES = {"buy", "sell"}
 VALID_CASH_DIRECTIONS = {"in", "out"}
 VALID_CORPORATE_ACTIONS = {"cash_dividend", "split_adjustment"}
+PORTFOLIO_FX_REFRESH_DISABLED_REASON = "portfolio_fx_update_disabled"
 
 
 class PortfolioConflictError(Exception):
@@ -67,6 +68,16 @@ class PortfolioOversellError(ValueError):
 class _AvgState:
     quantity: float = 0.0
     total_cost: float = 0.0
+
+
+@dataclass(frozen=True)
+class _ResolvedPositionPrice:
+    price: float
+    source: str
+    price_date: Optional[date]
+    is_stale: bool
+    is_available: bool
+    provider: Optional[str] = None
 
 
 class PortfolioService:
@@ -570,6 +581,8 @@ class PortfolioService:
     ) -> Dict[str, Any]:
         """Refresh account FX pairs online with stale fallback when fetch fails."""
         as_of_date = as_of or date.today()
+        config = get_config()
+        refresh_enabled = bool(getattr(config, "portfolio_fx_update_enabled", True))
         if account_id is not None:
             account_rows = [self._require_active_account(account_id)]
         else:
@@ -578,13 +591,19 @@ class PortfolioService:
         summary = {
             "as_of": as_of_date.isoformat(),
             "account_count": len(account_rows),
+            "refresh_enabled": refresh_enabled,
+            "disabled_reason": None if refresh_enabled else PORTFOLIO_FX_REFRESH_DISABLED_REASON,
             "pair_count": 0,
             "updated_count": 0,
             "stale_count": 0,
             "error_count": 0,
         }
         for account in account_rows:
-            item = self._refresh_account_fx_rates(account=account, as_of_date=as_of_date)
+            item = self._refresh_account_fx_rates(
+                account=account,
+                as_of_date=as_of_date,
+                refresh_enabled=refresh_enabled,
+            )
             summary["pair_count"] += item["pair_count"]
             summary["updated_count"] += item["updated_count"]
             summary["stale_count"] += item["stale_count"]
@@ -978,25 +997,29 @@ class PortfolioService:
                     }
                 )
 
-            last_price = self.repo.get_latest_close(symbol=symbol, as_of=as_of_date)
-            if last_price is None or last_price <= 0:
-                last_price = avg_cost
+            price_info = self._resolve_position_price(symbol=symbol, as_of_date=as_of_date)
+            last_price = price_info.price
 
-            local_market_value = qty * float(last_price)
-            market_base, stale_market, _ = self._convert_amount(
-                amount=local_market_value,
-                from_currency=currency,
-                to_currency=account.base_currency,
-                as_of_date=as_of_date,
-            )
-            cost_base, stale_cost, _ = self._convert_amount(
-                amount=total_cost,
-                from_currency=currency,
-                to_currency=account.base_currency,
-                as_of_date=as_of_date,
-            )
-            unrealized_base = market_base - cost_base
-            fx_stale = fx_stale or stale_market or stale_cost
+            if price_info.is_available:
+                local_market_value = qty * float(last_price)
+                market_base, stale_market, _ = self._convert_amount(
+                    amount=local_market_value,
+                    from_currency=currency,
+                    to_currency=account.base_currency,
+                    as_of_date=as_of_date,
+                )
+                cost_base, stale_cost, _ = self._convert_amount(
+                    amount=total_cost,
+                    from_currency=currency,
+                    to_currency=account.base_currency,
+                    as_of_date=as_of_date,
+                )
+                unrealized_base = market_base - cost_base
+                fx_stale = fx_stale or stale_market or stale_cost
+            else:
+                market_base = 0.0
+                cost_base = 0.0
+                unrealized_base = 0.0
 
             position_rows.append(
                 {
@@ -1010,6 +1033,11 @@ class PortfolioService:
                     "market_value_base": round(market_base, 8),
                     "unrealized_pnl_base": round(unrealized_base, 8),
                     "valuation_currency": account.base_currency,
+                    "price_source": price_info.source,
+                    "price_provider": price_info.provider,
+                    "price_date": price_info.price_date.isoformat() if price_info.price_date else None,
+                    "price_stale": price_info.is_stale,
+                    "price_available": price_info.is_available,
                 }
             )
 
@@ -1017,6 +1045,67 @@ class PortfolioService:
             total_cost_base += cost_base
 
         return position_rows, lot_rows, market_value_base, total_cost_base, fx_stale
+
+    def _resolve_position_price(self, *, symbol: str, as_of_date: date) -> _ResolvedPositionPrice:
+        today = date.today()
+
+        close = self.repo.get_latest_close_with_date(symbol=symbol, as_of=as_of_date)
+        if close is not None:
+            close_price, close_date = close
+            if close_price > 0:
+                return _ResolvedPositionPrice(
+                    price=float(close_price),
+                    source="history_close",
+                    price_date=close_date,
+                    is_stale=close_date < as_of_date,
+                    is_available=True,
+                )
+
+        if as_of_date == today:
+            realtime_price, provider = self._fetch_realtime_position_price(symbol)
+            if realtime_price is not None and realtime_price > 0:
+                return _ResolvedPositionPrice(
+                    price=float(realtime_price),
+                    source="realtime_quote",
+                    price_date=today,
+                    is_stale=False,
+                    is_available=True,
+                    provider=provider,
+                )
+
+        return _ResolvedPositionPrice(
+            price=0.0,
+            source="missing",
+            price_date=None,
+            is_stale=True,
+            is_available=False,
+        )
+
+    @staticmethod
+    def _fetch_realtime_position_price(symbol: str) -> Tuple[Optional[float], Optional[str]]:
+        try:
+            from data_provider.base import DataFetcherManager
+
+            quote = DataFetcherManager().get_realtime_quote(symbol, log_final_failure=False)
+        except Exception as exc:
+            logger.warning("Failed to fetch realtime portfolio price for %s: %s", symbol, exc)
+            return None, None
+
+        if quote is None:
+            return None, None
+
+        price = getattr(quote, "price", None)
+        try:
+            numeric_price = float(price)
+        except (TypeError, ValueError):
+            return None, None
+
+        if numeric_price <= 0:
+            return None, None
+
+        source = getattr(quote, "source", None)
+        provider = getattr(source, "value", None) or (str(source) if source is not None else None)
+        return numeric_price, provider
 
     @staticmethod
     def _consume_fifo_lots(
@@ -1136,24 +1225,64 @@ class PortfolioService:
             as_of_date=as_of_date,
         )
 
-    def _refresh_account_fx_rates(self, *, account: Any, as_of_date: date) -> Dict[str, int]:
-        """Refresh FX pairs for one account and keep stale fallback on failures."""
-        config = get_config()
-        if not getattr(config, "portfolio_fx_update_enabled", True):
-            return {"pair_count": 0, "updated_count": 0, "stale_count": 0, "error_count": 0}
-
+    def _list_account_refresh_fx_currencies(
+        self,
+        *,
+        account: Any,
+        as_of_date: date,
+        strict: bool = True,
+    ) -> List[str]:
+        """Return distinct non-base currencies participating in refresh for one account."""
         base_currency = self._normalize_currency(account.base_currency)
         currencies: Set[str] = set()
-        for row in self.repo.list_trades(account.id, as_of=as_of_date):
-            currencies.add(self._normalize_currency(row.currency))
-        for row in self.repo.list_cash_ledger(account.id, as_of=as_of_date):
-            currencies.add(self._normalize_currency(row.currency))
-
-        summary = {"pair_count": 0, "updated_count": 0, "stale_count": 0, "error_count": 0}
-        for from_currency in sorted(currencies):
-            if from_currency == base_currency:
+        rows = list(self.repo.list_trades(account.id, as_of=as_of_date))
+        rows.extend(self.repo.list_cash_ledger(account.id, as_of=as_of_date))
+        for row in rows:
+            try:
+                currency = self._normalize_currency(row.currency)
+            except ValueError:
+                if strict:
+                    raise
+                logger.warning(
+                    "Skip invalid FX refresh currency for account %s on %s: %r",
+                    account.id,
+                    as_of_date.isoformat(),
+                    getattr(row, "currency", None),
+                )
                 continue
-            summary["pair_count"] += 1
+            if currency != base_currency:
+                currencies.add(currency)
+        return sorted(currencies)
+
+    def _refresh_account_fx_rates(
+        self,
+        *,
+        account: Any,
+        as_of_date: date,
+        refresh_enabled: bool,
+    ) -> Dict[str, int]:
+        """Refresh FX pairs for one account and keep stale fallback on failures."""
+        refresh_currencies = self._list_account_refresh_fx_currencies(
+            account=account,
+            as_of_date=as_of_date,
+            strict=refresh_enabled,
+        )
+        if not refresh_enabled:
+            return {
+                "pair_count": len(refresh_currencies),
+                "updated_count": 0,
+                "stale_count": 0,
+                "error_count": 0,
+            }
+
+        base_currency = self._normalize_currency(account.base_currency)
+        summary = {
+            "pair_count": len(refresh_currencies),
+            "updated_count": 0,
+            "stale_count": 0,
+            "error_count": 0,
+        }
+        for from_currency in refresh_currencies:
             try:
                 rate = self._fetch_fx_rate_from_yfinance(
                     from_currency=from_currency,
